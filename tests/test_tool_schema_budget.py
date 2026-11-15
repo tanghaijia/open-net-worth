@@ -283,7 +283,10 @@ def test_total_tool_schemas_size_under_budget(tool_schemas):
     # says a 'total' account's balance is its untracked part, not cash; update_accounts takes
     # value_source; reconcile_accounts takes real_total; acquire_lots says not to ask for funding.
     # ~1.1K chars after trimming (create_account's value_source dropped — update_accounts sets it).
-    budget = 480_000
+    # 2026-11-15: 480_000 -> 492_000. Paper Trading's ten tools (ADR 2026-11-15-paper-trading-is-
+    # a-simulated-book-never-an-order-path) add ~11,800 chars. NOTE: main was already ~3,300 over
+    # 480_000 before them (unrelated growth), which this raise does not cover.
+    budget = 492_000
     assert total < budget, (
         f"TOOL_SCHEMAS json.dumps size is {total:,} chars — over the {budget:,}-char budget. "
         "Shorten a tool description or raise the budget intentionally (with a comment)."
