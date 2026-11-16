@@ -494,6 +494,56 @@ def _parse_multi_fetch_response(data: list) -> dict[int, tuple[bytes, str | None
     return result
 
 
+def _normalize_message_id(raw: str) -> str:
+    """Comparable form of a raw Message-ID header value.
+
+    Folds header unfolding whitespace and drops the surrounding angle brackets so
+    the SEARCH value and a header fetched back from the server compare equal.
+    """
+    return " ".join(raw.strip().split()).strip("<>").strip()
+
+
+def _build_message_id_index(conn: imaplib.IMAP4_SSL) -> dict[str, int]:
+    """Build a Message-ID -> UID map for the currently SELECTed folder.
+
+    Compatibility fallback for IMAP servers that do not index the Message-ID
+    header for SEARCH. Observed on imap.qq.com: ``UID SEARCH HEADER Message-ID
+    <raw>`` returns OK with an EMPTY result for a message that is present, while
+    ``UID FETCH <uid> (RFC822)`` works fine. BODY.PEEK keeps this read-only (no
+    \\Seen flag), and the header FETCH is batched so a folder of N messages costs
+    ceil(N / _HEADER_FETCH_CHUNK) round trips, not N.
+    """
+    typ, all_data = conn.uid("search", None, "ALL")
+    if typ != "OK":
+        logger.warning("imap: message-id index — UID SEARCH ALL failed")
+        return {}
+    all_uids = sorted(int(u) for u in (all_data[0] or b"").split())
+    if not all_uids:
+        return {}
+
+    index: dict[str, int] = {}
+    for chunk in _chunked(all_uids, _HEADER_FETCH_CHUNK):
+        uid_set = ",".join(str(u) for u in chunk)
+        typ, fetched = conn.uid(
+            "fetch", uid_set, "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+        )
+        if typ != "OK":
+            logger.warning("imap: message-id index — header FETCH chunk %s failed", uid_set)
+            continue
+        for uid, (payload, _date, _instant) in _parse_multi_fetch_response(fetched).items():
+            raw = (email.message_from_bytes(payload).get("Message-ID") or "").strip()
+            if raw:
+                # First UID wins: a duplicate Message-ID is ambiguous anyway, and
+                # the caller's locator-mismatch guard rejects a wrong resolution.
+                index.setdefault(_normalize_message_id(raw), uid)
+    logger.info(
+        "imap: message-id index built — %d uid(s) scanned, %d id(s) indexed",
+        len(all_uids),
+        len(index),
+    )
+    return index
+
+
 def test_connection(creds: dict) -> tuple[bool, str]:
     """Connect and authenticate only — no messages read, no cursor touched.
     Returns (True, "") on success or (False, error_message) on failure."""
@@ -735,7 +785,11 @@ def fetch_by_message_ids(
 
     Locates each message via ``UID SEARCH HEADER "Message-ID" <raw>`` in the configured
     folder (same "the configured folder is used unchanged" rule as ``search_headers`` —
-    no Gmail All Mail resolution) and fetches the FIRST match. A request with an empty
+    no Gmail All Mail resolution) and fetches the FIRST match. Servers that do not index
+    Message-ID for SEARCH (e.g. imap.qq.com) answer OK + EMPTY here; on the first such
+    miss this function builds a one-time ``Message-ID -> UID`` index from batched
+    ``BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`` fetches and resolves from that instead.
+    A request with an empty
     ``raw_message_id`` or no server match (deleted/
     moved/never existed) comes back ``found: False`` — this function never raises for a
     single missing id, so one gap in a batch doesn't fail its siblings.
@@ -766,6 +820,11 @@ def fetch_by_message_ids(
         if status != "OK":
             raise RuntimeError(f"could not select folder {configured_folder!r}")
 
+        # Some servers (notably imap.qq.com) return OK + empty for
+        # UID SEARCH HEADER Message-ID. Build the header index lazily — once per
+        # batch, and only after the first miss — so compliant servers keep the
+        # original one-round-trip path untouched.
+        message_id_index: dict[str, int] | None = None
         results: list[dict] = []
         for req in requests:
             if should_stop is not None and should_stop():
@@ -783,11 +842,20 @@ def fetch_by_message_ids(
             quoted = imap_quote_search_value(raw, field="message_id")
             typ, search_data = conn.uid("search", None, "HEADER", "Message-ID", quoted)
             uids = [int(u) for u in (search_data[0] or b"").split()] if typ == "OK" else []
-            if not uids:
-                logger.info("imap: fetch-by-message-id — no match for %s", message_id)
-                results.append({"message_id": message_id, "found": False})
-                continue
-            uid = uids[0]
+            if uids:
+                uid = uids[0]
+            else:
+                if message_id_index is None:
+                    logger.info(
+                        "imap: fetch-by-message-id — HEADER Message-ID search empty, "
+                        "falling back to header index"
+                    )
+                    message_id_index = _build_message_id_index(conn)
+                uid = message_id_index.get(_normalize_message_id(raw))
+                if uid is None:
+                    logger.info("imap: fetch-by-message-id — no match for %s", message_id)
+                    results.append({"message_id": message_id, "found": False})
+                    continue
             typ, fetched = conn.uid("fetch", str(uid), "(RFC822)")
             if typ != "OK" or not fetched or not fetched[0]:
                 logger.warning(
